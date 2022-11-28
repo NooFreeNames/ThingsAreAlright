@@ -1,0 +1,449 @@
+<?php
+
+/**
+ * Проверка на существование значения 
+ *
+ * @param string|null $value проверяемое значение
+ * @return string|null текст ошибки или null, если таковой не было найдено
+ */
+function validate_empty(?string $value): ?string
+{
+    if (empty($value)) {
+        return 'Поле не может быть пустым';
+    }
+    return null;
+}
+
+/**
+ * Проверка длины строки
+ *
+ * @param string $value проверяемая строка
+ * @param int $min минимально возможная длина строки 
+ * @param int|null $max максимально возможная длина строки
+ * @return string|null текст ошибки или null, если таковой не было найдено
+ */
+function validate_length(string $value, int $min = 0, int $max = null): ?string
+{
+    $length = mb_strlen($value);
+    $validate_empty = validate_empty($value);
+    if (isset($validate_empty)) {
+        return $validate_empty;
+    } elseif ($length < $min) {
+        return "Значение слишком короткое. Минимальная длина - $min";
+    } elseif ($max && $length > $max) {
+        return "Значение слишком длинное. Максимальная длина - $max";
+    }
+
+    return null;
+}
+
+/**
+ * Проверка E-mail
+ *
+ * @param string $email проеряемый E-mail
+ * @return string|null текст ошибки или null, если таковой не было найдено
+ */
+function validate_email(string $email): ?string
+{
+    $validate_empty = validate_empty($email);
+    if (isset($validate_empty)) {
+        return $validate_empty;
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return 'Неверный формат электронной почты';
+    }
+
+    return null;
+}
+
+/**
+ * Проверка даты
+ *
+ * @param string $date проверяемая дата
+ * @param string $format формат проверяемой даты
+ * @return string|null string|null текст ошибки или null, если таковой не было найдено
+ */
+function validate_date(string $date, string $format): ?string
+{
+    if (empty($date)) {
+        return null;
+    }
+
+    if (!is_date_valid($date)) {
+        return 'Неверный формат даты';
+    } else if ($date < date($format)) {
+        return 'Дата должна быть больше или равна текущей';
+    }
+
+    return null;
+}
+
+/**
+ * Получает из БД пользователя
+ *
+ * @param mysqli $conn Строка подключения
+ * @param string $email E-mail пользователя
+ * @return array|null Ассоциативный массив представляющий пользователя или null если пользователе не был найден
+ */
+function db_get_user(mysqli $conn, string $email): ?array
+{
+    $sql = 'SELECT * FROM user WHERE email=?';
+    $result = send_query($conn, $sql, $email);
+    return $result->fetch_assoc();
+}
+
+/**
+ * Возвращает список проэктов
+ *
+ * @param mysqli $conn Строка подключения
+ * @param int $user_id id пользователя
+ *
+ * @return false|mysqli_result возвращает результат sql-запроса или false в случае ошибки
+ */
+function db_get_projects(mysqli $conn, int $user_id): false|mysqli_result
+{
+    $sql = "SELECT COUNT(`project_id`) AS `count_project`, `project`.`id` AS `id`, `project`.`name` AS `name` FROM `task`
+        RIGHT JOIN `project` ON `task`.`project_id` = `project`.`id`
+        WHERE `project`.`user_id` = ? GROUP BY `project`.`id`, `project`.`name`";
+    return send_query($conn, $sql, $user_id);
+}
+
+/**
+ * Возвращает список задач
+ *
+ * @param mysqli $conn Строка подключения
+ * @param int $user_id id пользователя
+ * @param string|null $project Название проекта, если передать пустое значение фильтрация списка по проекту не будет выполнена
+ * @param string|null $search_query Поистковы запрос, если передать пустое значение фильтрация по поисковому запросу не будет выполнена
+ * @param string|null $filter Фильтер. может пренимать значения 'today', 'tomorrow', 'overdue', если передать пустое значение фильтрация не будет выполнена
+ * @return false|mysqli_result Список задач
+ */
+function db_get_tasks(mysqli $conn, int $user_id, ?string $project = null, ?string $search_query = null, ?string $filter = null): false|mysqli_result
+{
+    $sql = 'SELECT `task`.`id` AS id,
+            `task`.`name`,
+            `is_completed`,
+            `file_path`,
+            DATE_FORMAT(`end_date`, "%d.%m.%Y") AS `end_date`,
+            `project`.`name` AS `project`
+            FROM `task` INNER JOIN `project` ON `task`.`project_id` = `project`.`id`
+            WHERE `project`.`user_id` = ? ';
+    $params = [$user_id];
+    if (!empty($project)) {
+        $sql .= 'AND `project`.`name` = ? ';
+        $params[] = $project;
+    }
+
+    if ($filter === TODAY_FILTER) {
+        $sql .= 'AND DATE(end_date) = DATE(NOW()) ';
+    } elseif ($filter === TOMORROW_FILTER) {
+        $sql .= 'AND DATE(end_date) = DATE(NOW() + INTERVAL 1 DAY) ';
+    } elseif ($filter === OVERDUE_FILTER) {
+        $sql .= 'AND DATE(end_date) < DATE(NOW()) ';
+    }
+
+    if (!empty($search_query)) {
+        $sql .= 'AND MATCH(task.name) AGAINST(?) ORDER BY MATCH(task.name) AGAINST(?)';
+        $params[] = $search_query;
+        $params[] = $search_query;
+    }
+
+    $result = send_query($conn, $sql, ...$params);
+    if ($result->num_rows === 0) {
+        http_response_code(404);
+    }
+    return $result;
+}
+
+/**
+ * Добовляет пользователя в БД
+ *
+ * @param mysqli $conn Строка подключения
+ * @param string $name имя пользователя 
+ * @param string $password пароль прользователя
+ * @param string $email E-mail пользователя
+ */
+function db_insert_user(mysqli $conn, string $name, string $password, string $email)
+{
+    $password_hash = password_hash($password, PASSWORD_DEFAULT);
+    $sql = 'INSERT INTO user (username, password, email) VALUES (?,?,?)';
+    send_query($conn, $sql, $name, $password_hash, $email);
+}
+
+/**
+ * Добовляет проэкт в БД
+ *
+ * @param mysqli $conn Строка подключения
+ * @param int $user_id id пользователя
+ * @param string $name название проэкта
+ */
+function db_insert_project(mysqli $conn, int $user_id, string $name)
+{
+    $sql = 'INSERT INTO project (user_id, name) VALUES (?,?)';
+    send_query($conn, $sql, $user_id, $name);
+}
+
+/**
+ * Добовляет задачу в БД
+ *
+ * @param mysqli $conn Строка подключения
+ * @param string $name имя задач
+ * @param int $project_id id проэкта
+ * @param string|null $date дата окончания 
+ * @param string|null $file_path путь к файлу
+ */
+function db_insert_task(mysqli $conn, string $name, int $project_id, ?string $date = null, ?string $file_path = null)
+{
+    $sql = 'INSERT INTO task SET name=?, project_id=?';
+    $params = [$name, $project_id];
+    if (!empty($date)) {
+        $sql .= ", end_date='$date'";
+    }
+    if (!empty($file_path)) {
+        $sql .= ", file_path=?";
+        $params[] = $file_path;
+    }
+
+    send_query($conn, $sql, ...$params);
+}
+
+/**
+ * Проверяет существования пользователя
+ *
+ * @param mysqli $conn Строка подключения
+ * @param string $email E-mail пользователя
+ * @return int 1 - если пользователь найден и 0 - если нет
+ */
+function db_user_exist(mysqli $conn, string $email): int
+{
+    $sql = 'SELECT id FROM user WHERE email=?';
+    $result = send_query($conn, $sql, $email);
+    return $result->num_rows;
+}
+
+/**
+ * Проверяет существования проэкта
+ *
+ * @param mysqli $conn Строка подключения
+ * @param int $id id проэкта
+ * @return int 1 - если пользователь найден и 0 - если нет
+ */
+function db_project_exist(mysqli $conn, int $id): int
+{
+    $sql = "SELECT id FROM project WHERE id=$id";
+    return $conn->query($sql)->num_rows;
+}
+
+/**
+ * Изменяет статус задачи (завершено или нет)
+ *
+ * @param mysqli $conn Строка подключения
+ * @param int $task_id id задачи
+ * @param int $status статус 1 - завершено 0 - нет
+ */
+function db_update_task_status(mysqli $conn, int $task_id, int $status)
+{
+    if ($status > 1) {
+        $status = 1;
+    } elseif ($status < 0) {
+        $status = 0;
+    }
+    $sql = "UPDATE task SET is_completed = $status WHERE id = $task_id";
+    $conn->query($sql);
+}
+
+/**
+ * @param mysqli $conn
+ * @param string $sql
+ * @param mixed ...$params
+ * @return false|mysqli_result
+ */
+function send_query(mysqli $conn, string $sql, mixed &...$params): false|mysqli_result
+{
+    $types = '';
+    $code_names = ['integer' => 'i', 'double' => 'd', 'string' => 's'];
+    foreach ($params as $param) {
+        $types .= $code_names[gettype($param)] ?? '';
+    }
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+
+    return $stmt->get_result();
+}
+
+/**
+ * @param array|null $file
+ * @param string $dir
+ * @return bool
+ */
+function move_file(?array $file, string $dir): bool
+{
+    if (!isset($file)) {
+        return false;
+    }
+
+    $file_name = $file['name'];
+    return move_uploaded_file($file['tmp_name'], $dir . $file_name);
+}
+
+/**
+ * Вычисляет разницу между переданной датой и текущей датой
+ *
+ * @param string $date Дата в формате dd.mm.YYYY
+ *
+ * @return int Количество часов между переданной датой и текущей датой. Если переданная дата будет пусто, функция вернет количество
+ * часов в текущей дате
+ */
+function time_deff($date)
+{
+    if (empty($date)):
+        return time() / 3600;
+    endif;
+
+    return (strtotime($date) - strtotime(date('Y-m-d H:i:s'))) / 3600;
+}
+
+/**
+ * Проверяет переданную дату на соответствие формату 'ГГГГ-ММ-ДД'
+ *
+ * Примеры использования:
+ * is_date_valid('2019-01-01'); // true
+ * is_date_valid('2016-02-29'); // true
+ * is_date_valid('2019-04-31'); // false
+ * is_date_valid('10.10.2010'); // false
+ * is_date_valid('10/10/2010'); // false
+ *
+ * @param string $date Дата в виде строки
+ *
+ * @return bool true при совпадении с форматом 'ГГГГ-ММ-ДД', иначе false
+ */
+function is_date_valid(string $date): bool
+{
+    $format_to_check = 'Y-m-d';
+    $dateTimeObj = date_create_from_format($format_to_check, $date);
+
+    return $dateTimeObj !== false && array_sum(date_get_last_errors()) === 0;
+}
+
+/**
+ * Создает подготовленное выражение на основе готового SQL запроса и переданных данных
+ *
+ * @param $link mysqli Ресурс соединения
+ * @param $sql string SQL запрос с плейсхолдерами вместо значений
+ * @param array $data Данные для вставки на место плейсхолдеров
+ *
+ * @return mysqli_stmt Подготовленное выражение
+ */
+function db_get_prepare_stmt($link, $sql, $data = [])
+{
+    $stmt = mysqli_prepare($link, $sql);
+
+    if ($stmt === false) {
+        $errorMsg = 'Не удалось инициализировать подготовленное выражение: ' . mysqli_error($link);
+        die($errorMsg);
+    }
+
+    if ($data) {
+        $types = '';
+        $stmt_data = [];
+
+        foreach ($data as $value) {
+            $type = 's';
+
+            if (is_int($value)) {
+                $type = 'i';
+            } else if (is_string($value)) {
+                $type = 's';
+            } else if (is_double($value)) {
+                $type = 'd';
+            }
+
+            if ($type) {
+                $types .= $type;
+                $stmt_data[] = $value;
+            }
+        }
+
+        $values = array_merge([$stmt, $types], $stmt_data);
+
+        $func = 'mysqli_stmt_bind_param';
+        $func(...$values);
+
+        if (mysqli_errno($link) > 0) {
+            $errorMsg = 'Не удалось связать подготовленное выражение с параметрами: ' . mysqli_error($link);
+            die($errorMsg);
+        }
+    }
+
+    return $stmt;
+}
+
+/**
+ * Возвращает корректную форму множественного числа
+ * Ограничения: только для целых чисел
+ *
+ * Пример использования:
+ * $remaining_minutes = 5;
+ * echo "Я поставил таймер на {$remaining_minutes} " .
+ *     get_noun_plural_form(
+ *         $remaining_minutes,
+ *         'минута',
+ *         'минуты',
+ *         'минут'
+ *     );
+ * Результат: "Я поставил таймер на 5 минут"
+ *
+ * @param int $number Число, по которому вычисляем форму множественного числа
+ * @param string $one Форма единственного числа: яблоко, час, минута
+ * @param string $two Форма множественного числа для 2, 3, 4: яблока, часа, минуты
+ * @param string $many Форма множественного числа для остальных чисел
+ *
+ * @return string Рассчитанная форма множественнго числа
+ */
+function get_noun_plural_form(int $number, string $one, string $two, string $many): string
+{
+    $number = (int)$number;
+    $mod10 = $number % 10;
+    $mod100 = $number % 100;
+
+    switch (true) {
+        case ($mod100 >= 11 && $mod100 <= 20):
+            return $many;
+
+        case ($mod10 > 5):
+            return $many;
+
+        case ($mod10 === 1):
+            return $one;
+
+        case ($mod10 >= 2 && $mod10 <= 4):
+            return $two;
+
+        default:
+            return $many;
+    }
+}
+
+/**
+ * Подключает шаблон, передает туда данные и возвращает итоговый HTML контент
+ * @param string $name Путь к файлу шаблона относительно папки templates
+ * @param array $data Ассоциативный массив с данными для шаблона
+ * @return string Итоговый HTML
+ */
+function include_template($name, array $data = [])
+{
+    $name = 'templates/' . $name;
+    $result = '';
+
+    if (!is_readable($name)) {
+        return $result;
+    }
+
+    ob_start();
+    extract($data);
+    require $name;
+
+    $result = ob_get_clean();
+
+    return $result;
+}
